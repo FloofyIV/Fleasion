@@ -123,8 +123,6 @@ else:
     _PLATFORM_TEMP_DIR = Path(os.environ.get('TEMP', r'C:\Windows\Temp'))
 _HOSTS_MARKER = '# Fleasion proxy entry'
 _HOSTS_FILE_REPAIR_THRESHOLD_BYTES = 512 * 1024
-SOBER_CUSTOM_FFLAG_ROUTE_ARM_DELAY_SECONDS = 30.0
-_SOBER_CUSTOM_FFLAG_POLL_SECONDS = 0.25
 
 # Registry key used by Windows to replace files on next reboot
 _PENDING_RENAME_KEY = r'SYSTEM\CurrentControlSet\Control\Session Manager'
@@ -1116,6 +1114,62 @@ def _select_proxy_ca_dir() -> Path:
 def _current_proxy_ca_dir() -> Path:
     return _ACTIVE_PROXY_CA_DIR
 
+_CUSTOM_FFLAG_FIRST_LAUNCH_PASSTHROUGH_COUNT = 1
+_custom_fflag_passthrough_lock = threading.Lock()
+_custom_fflag_launch_passthrough_remaining: int = _CUSTOM_FFLAG_FIRST_LAUNCH_PASSTHROUGH_COUNT
+_custom_fflag_last_engine_process: tuple[int, float] | None = None
+
+
+def _custom_fflag_engine_process() -> tuple[int, float] | None:
+    """Return the selected Linux client's engine process identity, if running."""
+    from ..utils.platform_linux import linux_client_main_process
+
+    return linux_client_main_process(_selected_linux_client_installation())
+
+
+def _should_intercept_custom_fflag_connection() -> bool:
+    """Gate ClientSettings interception on a per-launch request counter.
+
+    The Linux client's launch-time ClientSettings fetch comes from its pinned
+    bootstrap and must fall through unmodified: intercepting it makes the client
+    detect the proxy and refuse to start with a fake internet error. Custom
+    FastFlags are therefore delivered pre-launch via the client's configuration
+    and by interception starting with the second request. The fall-through
+    re-arms whenever a new engine process identity is seen, so every launch
+    behaves the same way.
+    """
+    global _custom_fflag_launch_passthrough_remaining, _custom_fflag_last_engine_process
+
+    if not IS_LINUX:
+        return True
+    fall_through = False
+    with _custom_fflag_passthrough_lock:
+        engine_process = _custom_fflag_engine_process()
+        if engine_process is not None and engine_process != _custom_fflag_last_engine_process:
+            _custom_fflag_launch_passthrough_remaining = (
+                _CUSTOM_FFLAG_FIRST_LAUNCH_PASSTHROUGH_COUNT
+            )
+            log_buffer.log(
+                'CustomFFlags',
+                f'Detected client engine process {engine_process[0]}; the first '
+                'clientsettingscdn.roblox.com request of this launch will fall through',
+            )
+        _custom_fflag_last_engine_process = engine_process
+        if _custom_fflag_launch_passthrough_remaining > 0:
+            _custom_fflag_launch_passthrough_remaining -= 1
+            fall_through = True
+    if fall_through:
+        log_buffer.log(
+            'CustomFFlags',
+            'clientsettingscdn.roblox.com connection: first request after client '
+            'launch falls through unmodified',
+        )
+        return False
+    log_buffer.log(
+        'CustomFFlags',
+        'clientsettingscdn.roblox.com connection: passing to interception',
+    )
+    return True
 
 def _is_macos_studio_bundle_path(exe_path: Path) -> bool:
     if not IS_MACOS:
@@ -3960,9 +4014,11 @@ class ProxyMaster:
         self,
         config_manager,
         on_proxy_start_error: Optional[Callable[[str, dict], None]] = None,
+        on_notify: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.config_manager = config_manager
         self._on_proxy_start_error = on_proxy_start_error
+        self._on_notify = on_notify
         if IS_LINUX:
             from ..utils.platform_linux import recover_stale_linux_client_env_proxy_override
 
@@ -3984,6 +4040,11 @@ class ProxyMaster:
         self.custom_fflag_modifier = CustomFFlagModifier(
             config_manager, reload_settings_from_disk=True
         )
+        set_delivery_notification_callback = getattr(
+            self.custom_fflag_modifier, 'set_delivery_notification_callback', None
+        )
+        if callable(set_delivery_notification_callback):
+            set_delivery_notification_callback(self._emit_custom_fflag_notification)
 
         self._texture_stripper: Optional[TextureStripper] = None
 
@@ -4019,8 +4080,6 @@ class ProxyMaster:
         self._roblox_player_running: bool = False
         self._watchdog_stop: Optional[threading.Event] = None
         self._watchdog_thread: Optional[threading.Thread] = None
-        self._sober_fflag_timer_stop: Optional[threading.Event] = None
-        self._sober_fflag_timer_thread: Optional[threading.Thread] = None
         self._module_interceptors: list = [self.username_spoofer]
         self._cert_refresh_lock = threading.Lock()
         self._last_cert_refresh_by_exe: dict[Path, tuple[float, str]] = {}
@@ -4101,15 +4160,7 @@ class ProxyMaster:
 
     def _linux_env_proxy_excluded_hosts(self) -> set[str]:
         """Return selected-client hosts that explicit mode must tunnel."""
-        hosts = self._linux_proxy_passthrough_hosts()
-        descriptor = self._linux_client_descriptor()
-        route_delay = getattr(descriptor, 'clientsettings_route_delay_seconds', 0.0)
-        if route_delay > 0:
-            # The first ClientSettings request is made by Sober's pinned
-            # bootstrap client, so keep it tunneled until the descriptor's
-            # route-arm delay has elapsed.
-            hosts.update(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
-        return hosts
+        return self._linux_proxy_passthrough_hosts()
 
     def _arm_linux_env_proxy_override(self) -> bool:
         """Arm the explicit proxy for exactly the selected Linux client."""
@@ -4421,11 +4472,7 @@ class ProxyMaster:
         if spoofer_enabled:
             hosts.update(USERNAME_SPOOFER_INTERCEPT_HOSTS)
         custom_modifier = getattr(self, 'custom_fflag_modifier', None)
-        if (
-            custom_modifier is not None
-            and custom_modifier.is_enabled()
-            and self._linux_sober_custom_fflag_routes_ready()
-        ):
+        if custom_modifier is not None and custom_modifier.is_enabled():
             hosts.update(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
         return hosts
 
@@ -4449,144 +4496,6 @@ class ProxyMaster:
             f'{"yes" if bool(set(hosts) & USERNAME_SPOOFER_INTERCEPT_HOSTS) else "no"}; '
             f'hosts={", ".join(sorted(hosts))}',
         )
-
-    @staticmethod
-    def _sober_boottime() -> float:
-        clock_id = getattr(time, 'CLOCK_BOOTTIME', None)
-        if clock_id is None:
-            return time.monotonic()
-        return time.clock_gettime(clock_id)
-
-    def _linux_sober_custom_fflag_routes_ready(self) -> bool:
-        """Return when selected-client ClientSettings interception is safe."""
-        # Tests (and platform-specific callers) can override one platform flag
-        # without clearing the host platform flag.  Treat the Linux delay as
-        # active only when Linux is the selected platform.
-        if not IS_LINUX or IS_WINDOWS or IS_MACOS:
-            return True
-        installation = self._linux_client_installation()
-        descriptor = self._linux_client_descriptor()
-        route_delay = float(
-            getattr(
-                descriptor,
-                'clientsettings_route_delay_seconds',
-                SOBER_CUSTOM_FFLAG_ROUTE_ARM_DELAY_SECONDS,
-            )
-        )
-        if route_delay <= 0:
-            return True
-        if installation is None:
-            return False
-        from ..utils.platform_linux import linux_client_main_process
-
-        process = linux_client_main_process(installation)
-        if process is None:
-            return False
-        _pid, started_at = process
-        return self._sober_boottime() - started_at >= route_delay
-
-    def _set_linux_sober_clientsettings_passthrough(self, enabled: bool) -> None:
-        """Keep Sober's pinned ClientSettings bootstrap outside TLS interception."""
-        if self._proxy is None:
-            return
-        excluded_hosts = set(getattr(self, '_env_proxy_intercept_excluded_hosts', set()))
-        if enabled:
-            excluded_hosts.update(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
-        else:
-            excluded_hosts.difference_update(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
-        self._env_proxy_intercept_excluded_hosts = excluded_hosts
-        setter = getattr(self._proxy, 'set_intercept_excluded_hosts', None)
-        if callable(setter):
-            setter(excluded_hosts)
-
-    def _start_linux_sober_custom_fflag_timer(self) -> None:
-        """Arm Linux ClientSettings interception after Sober's bootstrap window."""
-        installation = self._linux_client_installation()
-        descriptor = self._linux_client_descriptor()
-        client_name = getattr(installation, 'display_name', 'Linux Roblox client')
-        route_delay = float(
-            getattr(
-                descriptor,
-                'clientsettings_route_delay_seconds',
-                SOBER_CUSTOM_FFLAG_ROUTE_ARM_DELAY_SECONDS,
-            )
-        )
-        if (
-            not IS_LINUX
-            or installation is None
-            or route_delay <= 0
-            or (self._sober_fflag_timer_thread and self._sober_fflag_timer_thread.is_alive())
-        ):
-            return
-
-        stop_event = threading.Event()
-        self._sober_fflag_timer_stop = stop_event
-
-        def _poll() -> None:
-            from ..utils.platform_linux import linux_client_main_process
-
-            previous_process: tuple[int, float] | None = None
-            previous_ready: bool | None = None
-            previous_custom_fflags_enabled: bool | None = None
-            while not stop_event.is_set():
-                process = linux_client_main_process(installation)
-                custom_fflags_enabled = bool(
-                    getattr(self.config_manager, 'custom_fflags_enabled', False)
-                )
-                ready = False
-                if process is not None:
-                    _pid, started_at = process
-                    ready = (
-                        custom_fflags_enabled
-                        and self._sober_boottime() - started_at >= route_delay
-                    )
-
-                if process != previous_process:
-                    if process is None and previous_process is not None:
-                        log_buffer.log(
-                            'CustomFFlags',
-                            f'{client_name} closed; Linux ClientSettings interception timer reset',
-                        )
-                    elif process is not None:
-                        remaining = max(
-                            0.0,
-                            route_delay - (self._sober_boottime() - process[1]),
-                        )
-                        log_buffer.log(
-                            'CustomFFlags',
-                            f'Detected {client_name} engine; delaying Linux ClientSettings interception '
-                            f'for {remaining:.0f} seconds to pass the pinned bootstrap fetch',
-                        )
-                    previous_process = process
-
-                if (
-                    ready != previous_ready
-                    or custom_fflags_enabled != previous_custom_fflags_enabled
-                ):
-                    if ready:
-                        log_buffer.log(
-                            'CustomFFlags',
-                            'Linux ClientSettings interception armed; custom FastFlags will '
-                            f"arrive on {client_name}'s 120-second dynamic refresh",
-                        )
-                    self._set_linux_sober_clientsettings_passthrough(not ready)
-                    self.refresh_username_spoofer_interception()
-                    previous_ready = ready
-                    previous_custom_fflags_enabled = custom_fflags_enabled
-                stop_event.wait(_SOBER_CUSTOM_FFLAG_POLL_SECONDS)
-
-        self._sober_fflag_timer_thread = threading.Thread(
-            target=_poll, daemon=True, name='fleasion-linux-clientsettings-timer'
-        )
-        self._sober_fflag_timer_thread.start()
-
-    def _stop_linux_sober_custom_fflag_timer(self) -> None:
-        if self._sober_fflag_timer_stop is not None:
-            self._sober_fflag_timer_stop.set()
-        if self._sober_fflag_timer_thread is not None and self._sober_fflag_timer_thread.is_alive():
-            self._sober_fflag_timer_thread.join(timeout=2.0)
-        self._sober_fflag_timer_stop = None
-        self._sober_fflag_timer_thread = None
 
     def _startup_intercept_hosts(self) -> set[str]:
         hosts = self._desired_intercept_hosts()
@@ -4782,6 +4691,15 @@ class ProxyMaster:
             self._on_proxy_start_error(code, details)
         except Exception as exc:
             log_buffer.log('Error', f'Failed to dispatch proxy startup error callback: {exc}')
+
+    def _emit_custom_fflag_notification(self, title: str, message: str) -> None:
+        """Forward FastFlag delivery notifications to the app layer."""
+        if self._on_notify is None:
+            return
+        try:
+            self._on_notify(title, message)
+        except Exception as exc:
+            log_buffer.log('Error', f'Failed to dispatch proxy notification callback: {exc}')
 
     def _start_watchdog(self) -> None:
         """Start the platform crash guard/heartbeat thread."""
@@ -5317,7 +5235,6 @@ class ProxyMaster:
         texture_stripper = getattr(self, '_texture_stripper', None)
         if texture_stripper is not None:
             texture_stripper.reset_routes('proxy stop')
-        self._stop_linux_sober_custom_fflag_timer()
         self._cleanup_linux_client_proxy_state()
         with self._lock:
             if not self._running and not (self._thread and self._thread.is_alive()):
@@ -5971,7 +5888,15 @@ class ProxyMaster:
             # wipe that from the log so the traffic tab only ever shows genuine
             # client requests, not Fleasion's own startup TLS probe.
             self._proxy.clear_request_log()
-            self._start_linux_sober_custom_fflag_timer()
+            if IS_LINUX:
+                predicate_setter = getattr(self._proxy, 'set_intercept_connection_predicate', None)
+                if callable(predicate_setter):
+                    predicate_setter(
+                        lambda host: (
+                            host not in CUSTOM_FFLAGS_INTERCEPT_HOSTS
+                            or _should_intercept_custom_fflag_connection()
+                        )
+                    )
 
             log_buffer.log('Info', '=' * 50)
             log_buffer.log('Info', 'Fleasion Proxy Active')
@@ -5999,7 +5924,6 @@ class ProxyMaster:
                 ready_event = getattr(self, '_env_proxy_ready', None)
                 if ready_event is not None:
                     ready_event.clear()
-                self._stop_linux_sober_custom_fflag_timer()
                 self._running = False
             return
         if use_linux_helper:
@@ -6137,7 +6061,15 @@ class ProxyMaster:
         _schedule_hosts_cleanup_on_reboot()  # Boot guard: power-loss / BSOD
         _upsert_watchdog_task()  # Initial task creation
         self._start_watchdog()  # Keep task pushed 5 s ahead
-        self._start_linux_sober_custom_fflag_timer()
+        if IS_LINUX:
+            predicate_setter = getattr(self._proxy, 'set_intercept_connection_predicate', None)
+            if callable(predicate_setter):
+                predicate_setter(
+                    lambda host: (
+                        host not in CUSTOM_FFLAGS_INTERCEPT_HOSTS
+                        or _should_intercept_custom_fflag_connection()
+                    )
+                )
         hosts_ready_event = getattr(self, '_hosts_proxy_ready', None)
         if hosts_ready_event is not None:
             hosts_ready_event.set()
@@ -6177,7 +6109,6 @@ class ProxyMaster:
             hosts_ready_event = getattr(self, '_hosts_proxy_ready', None)
             if hosts_ready_event is not None:
                 hosts_ready_event.clear()
-            self._stop_linux_sober_custom_fflag_timer()
             # Ensure hosts file is cleaned up even if stop() wasn't called
             if self._hosts_installed:
                 self._stop_watchdog()

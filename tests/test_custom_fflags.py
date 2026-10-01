@@ -1,6 +1,8 @@
 import asyncio
 import json
+import stat
 import threading
+from compression.zstd import compress as zstd_compress, decompress as zstd_decompress
 from types import SimpleNamespace
 
 from fleasion.proxy.addons import custom_fflags as custom_fflags_module
@@ -288,6 +290,106 @@ def test_modifier_removes_all_saved_overrides_when_windows_feature_is_disabled(t
     assert payload == {'Existing': 'True'}
 
 
+def test_modifier_primes_linux_sober_flag_cache(tmp_path):
+    config = SimpleNamespace(
+        custom_fflags_enabled=True,
+        custom_fflags={'DFFlagDebugDrawBroadPhaseAABBs': 'True', 'FFlagExample': 'False'},
+    )
+    cache_dir = tmp_path / 'cache'
+    cache_path = cache_dir / 'flag_cache.dat'
+    cache_dir.mkdir()
+    cache_path.write_bytes(
+        b'\x00\x00\x00\x00\x00'
+        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+    )
+    modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
+    try:
+        assert modifier.prime_startup_flag_cache()
+
+        assert cache_path.read_bytes()[:5] == b'\x00\x00\x00\x00\x00'
+        payload = json.loads(cache_path.read_bytes()[5:])['applicationSettings']
+        assert payload['Existing'] == 'True'
+        assert payload['DFFlagDebugDrawBroadPhaseAABBs'] == 'True'
+        assert payload['FFlagExample'] == 'False'
+        assert payload[DYNAMIC_VARIABLE_RELOAD_INTERVAL_FLAG] == '1'
+        # The seeded cache is frozen so Sober cannot overwrite it from the
+        # network before the Player reads it.
+        assert not cache_path.stat().st_mode & stat.S_IWRITE
+        assert not cache_dir.stat().st_mode & stat.S_IWUSR
+    finally:
+        cache_path.chmod(0o644)
+        cache_dir.chmod(0o755)
+
+
+def test_modifier_creates_missing_linux_sober_flag_cache(tmp_path):
+    config = SimpleNamespace(
+        custom_fflags_enabled=True,
+        custom_fflags={'FFlagExample': 'True'},
+    )
+    cache_path = tmp_path / 'cache' / 'flag_cache.dat'
+    modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
+
+    assert not modifier.prime_startup_flag_cache()
+
+
+def test_modifier_unlocks_and_reseeds_locked_linux_sober_flag_cache(tmp_path):
+    config = SimpleNamespace(
+        custom_fflags_enabled=True,
+        custom_fflags={'FFlagExample': 'True'},
+    )
+    cache_dir = tmp_path / 'cache'
+    cache_path = cache_dir / 'flag_cache.dat'
+    cache_dir.mkdir()
+    cache_path.write_bytes(
+        b'\x00\x00\x00\x00\x00'
+        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+    )
+    modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
+    try:
+        assert modifier.prime_startup_flag_cache()
+        # The first prime call locks the cache; the next call must unlock and
+        # re-seed through that lock.
+        config.custom_fflags = {'FFlagExample': 'False'}
+        assert modifier.prime_startup_flag_cache()
+        payload = json.loads(cache_path.read_bytes()[5:])['applicationSettings']
+        assert payload['FFlagExample'] == 'False'
+        assert not cache_path.stat().st_mode & stat.S_IWRITE
+        assert not cache_dir.stat().st_mode & stat.S_IWUSR
+    finally:
+        cache_path.chmod(0o644)
+        cache_dir.chmod(0o755)
+
+
+def test_modifier_removes_previous_linux_seed_when_flags_change_or_disable(tmp_path):
+    config = SimpleNamespace(
+        custom_fflags_enabled=True,
+        custom_fflags={'FFlagExample': 'True'},
+    )
+    cache_dir = tmp_path / 'cache'
+    cache_path = cache_dir / 'flag_cache.dat'
+    cache_dir.mkdir()
+    cache_path.write_bytes(
+        b'\x00\x00\x00\x00\x00'
+        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+    )
+    modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
+    try:
+        assert modifier.prime_linux_flag_cache()
+        config.custom_fflags = {'FFlagExample': 'False'}
+        assert modifier.prime_linux_flag_cache()
+        payload = json.loads(cache_path.read_bytes()[5:])['applicationSettings']
+        assert payload['FFlagExample'] == 'False'
+
+        config.custom_fflags_enabled = False
+        assert modifier.prime_linux_flag_cache()
+        payload = json.loads(cache_path.read_bytes()[5:])['applicationSettings']
+        assert payload == {'Existing': 'True'}
+    finally:
+        cache_path.chmod(0o644)
+        cache_dir.chmod(0o755)
+
+
+
 def test_modifier_primes_macos_player_client_settings(tmp_path):
     config = SimpleNamespace(
         custom_fflags_enabled=True,
@@ -381,6 +483,72 @@ def test_late_response_from_previous_player_cannot_satisfy_new_launch():
 
     assert not modifier.note_response_success(generation=old_generation)
     assert modifier.requires_fresh_response()
+
+
+def test_delivery_notifications_fire_once_per_stage_and_rearm_after_relaunch():
+    config = SimpleNamespace(custom_fflags_enabled=True, custom_fflags={'FFlagExample': 'True'})
+    modifier = CustomFFlagModifier(config)
+    messages: list[str] = []
+    modifier.set_delivery_notification_callback(lambda _title, message: messages.append(message))
+
+    modifier.note_response_success()
+    modifier.note_response_success()
+    modifier.note_response_success()
+    assert messages == ['FFlags applied', 'Live editing now available']
+
+    # Closing and reopening the client re-arms both notifications.
+    modifier.prepare_for_player_launch()
+    modifier.note_response_success()
+    modifier.note_response_success()
+    assert messages == [
+        'FFlags applied',
+        'Live editing now available',
+        'FFlags applied',
+        'Live editing now available',
+    ]
+
+
+def test_delivery_notifications_ignore_stale_generation_responses():
+    config = SimpleNamespace(custom_fflags_enabled=True, custom_fflags={'FFlagExample': 'True'})
+    modifier = CustomFFlagModifier(config)
+    messages: list[str] = []
+    modifier.set_delivery_notification_callback(lambda _title, message: messages.append(message))
+    old_generation = modifier.delivery_generation()
+
+    modifier.prepare_for_player_launch()
+    assert not modifier.note_response_success(generation=old_generation)
+    assert messages == []
+
+
+def test_bodyless_304_response_advances_delivery_notifications():
+    config = SimpleNamespace(custom_fflags_enabled=True, custom_fflags={'FFlagExample': 'True'})
+    modifier = CustomFFlagModifier(config)
+    messages: list[str] = []
+    modifier.set_delivery_notification_callback(lambda _title, message: messages.append(message))
+
+    modifier.note_response_success()
+    # A 304 Not Modified carries no body, so it cannot update fresh-response
+    # bookkeeping, but it still proves the live loop and must fire the second
+    # notification.
+    assert modifier.note_client_settings_seen()
+    assert messages == ['FFlags applied', 'Live editing now available']
+
+    assert modifier.requires_fresh_response() is False
+    modifier.prepare_for_player_launch()
+    assert not modifier.note_client_settings_seen(generation=0)
+    assert messages == ['FFlags applied', 'Live editing now available']
+
+
+def test_delivery_notification_callback_faults_never_break_delivery():
+    config = SimpleNamespace(custom_fflags_enabled=True, custom_fflags={'FFlagExample': 'True'})
+    modifier = CustomFFlagModifier(config)
+
+    def broken_callback(_title: str, _message: str) -> None:
+        raise RuntimeError('notification backend failed')
+
+    modifier.set_delivery_notification_callback(broken_callback)
+    assert modifier.note_response_success()
+    assert not modifier.requires_fresh_response()
 
 
 def test_delivery_generation_check_and_commit_are_atomic(monkeypatch):

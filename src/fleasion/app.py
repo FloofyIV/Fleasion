@@ -3118,6 +3118,7 @@ class _ProxyErrorInvoker(QObject):
     show_proxy_error = pyqtSignal(str, dict)
     disable_proxy_features = pyqtSignal(str)
     retry_proxy = pyqtSignal()
+    tray_notification = pyqtSignal(str, str)
 
     @pyqtSlot(str, dict)
     def handle_proxy_error(self, code: str, details: dict):
@@ -4464,8 +4465,15 @@ def main():
             return
         proxy_error_invoker.show_proxy_error.emit(code, dict(details))
 
+    def _on_proxy_notification(title: str, message: str):
+        proxy_error_invoker.tray_notification.emit(title, message)
+
     # Initialize proxy master
-    proxy_master = ProxyMaster(config_manager, on_proxy_start_error=_on_proxy_start_error)
+    proxy_master = ProxyMaster(
+        config_manager,
+        on_proxy_start_error=_on_proxy_start_error,
+        on_notify=_on_proxy_notification,
+    )
     proxy_error_invoker.retry_proxy.connect(proxy_master.start)
 
     # Initialize modification manager (pass cache_scraper for asset-id resolution)
@@ -4690,6 +4698,7 @@ def main():
     # Create system tray
     tray = SystemTray(app, config_manager, proxy_master, mod_manager, roblox_monitor)
     tray_ref['tray'] = tray
+    proxy_error_invoker.tray_notification.connect(tray.show_notification)
     _single_instance_tray = tray
     app.aboutToQuit.connect(tray.cleanup_tray_icon)
     single_instance_control_server = _start_single_instance_control_server(app, tray)

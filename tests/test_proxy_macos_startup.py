@@ -90,7 +90,6 @@ def test_linux_proxy_stop_clears_exact_owned_flatpak_env_override(monkeypatch):
     proxy._env_proxy_ready.set()
     proxy._linux_env_proxy_override_client_key = 'sober'
     proxy._sober_env_proxy_override_active = True
-    proxy._stop_linux_sober_custom_fflag_timer = lambda: None
     proxy._lock = threading.Lock()
     proxy._running = False
     proxy._thread = None
@@ -755,53 +754,44 @@ def test_linux_helper_does_not_intercept_profile_api_when_spoofer_disabled(monke
     assert proxy._desired_intercept_hosts() == set(proxy_master.BASE_INTERCEPT_HOSTS)
 
 
-def test_linux_custom_fflags_wait_for_sober_engine_bootstrap_window(monkeypatch):
-    from fleasion.utils import platform_linux
-
-    monkeypatch.setattr(proxy_master, "IS_LINUX", True)
-    monkeypatch.setattr(proxy_master, "IS_MACOS", False)
-    monkeypatch.setattr(
-        proxy_master.ProxyMaster,
-        "_sober_boottime",
-        staticmethod(lambda: 130.0),
-    )
-
+def test_linux_custom_fflags_intercept_immediately_for_engine_process():
     proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
     proxy.config_manager = SimpleNamespace(settings={})
     proxy.username_spoofer = SimpleNamespace(is_enabled=lambda: False)
     proxy.custom_fflag_modifier = SimpleNamespace(is_enabled=lambda: True)
-    installation = SimpleNamespace(
-        key='sober',
-        client=SimpleNamespace(clientsettings_route_delay_seconds=30.0),
-    )
-    proxy._active_linux_client_installation = installation
-    proxy._active_linux_client_key = 'sober'
 
-    monkeypatch.setattr(
-        platform_linux,
-        "linux_client_main_process",
-        lambda _installation: (1001, 100.1),
-    )
-    assert proxy._desired_intercept_hosts() == set(proxy_master.BASE_INTERCEPT_HOSTS)
-
-    monkeypatch.setattr(
-        platform_linux,
-        "linux_client_main_process",
-        lambda _installation: (1001, 100.0),
-    )
     assert proxy._desired_intercept_hosts() == (
         set(proxy_master.BASE_INTERCEPT_HOSTS)
         | set(proxy_master.CUSTOM_FFLAGS_INTERCEPT_HOSTS)
     )
 
-    # A quick close/reopen produces a new process identity and starts a fresh
-    # bootstrap guard rather than inheriting the old process's elapsed time.
+
+def test_linux_custom_fflags_first_engine_request_falls_through(monkeypatch):
+    from fleasion.utils import platform_linux
+
+    monkeypatch.setattr(proxy_master, 'IS_LINUX', True)
+    engine = {'process': (1001, 0.0)}
     monkeypatch.setattr(
         platform_linux,
-        "linux_client_main_process",
-        lambda _installation: (1002, 129.9),
+        'linux_client_main_process',
+        lambda _installation: engine['process'],
     )
-    assert proxy._desired_intercept_hosts() == set(proxy_master.BASE_INTERCEPT_HOSTS)
+    proxy_master._custom_fflag_launch_passthrough_remaining = 1
+    proxy_master._custom_fflag_last_engine_process = None
+
+    # The very first engine request of a launch tunnels through untouched:
+    # intercepting the pinned bootstrap fetch makes the client refuse to start.
+    assert not proxy_master._should_intercept_custom_fflag_connection()
+    # From the second request on, the connection is TLS-intercepted.
+    assert proxy_master._should_intercept_custom_fflag_connection()
+    assert proxy_master._should_intercept_custom_fflag_connection()
+
+    # A relaunched engine process (new identity) re-arms the fall-through even
+    # if no connection was observed while the client was closed.
+    engine['process'] = (1002, 0.0)
+    assert not proxy_master._should_intercept_custom_fflag_connection()
+    assert proxy_master._should_intercept_custom_fflag_connection()
+    assert proxy_master._should_intercept_custom_fflag_connection()
 
 
 def test_linux_env_proxy_exclusions_come_from_selected_descriptor():
@@ -811,30 +801,10 @@ def test_linux_env_proxy_exclusions_come_from_selected_descriptor():
         key='sober',
         client=SimpleNamespace(
             proxy_passthrough_hosts=frozenset({'bootstrap.example'}),
-            clientsettings_route_delay_seconds=30.0,
         ),
     )
 
-    assert proxy._linux_env_proxy_excluded_hosts() == (
-        {'bootstrap.example'} | set(proxy_master.CUSTOM_FFLAGS_INTERCEPT_HOSTS)
-    )
-
-
-def test_linux_sober_clientsettings_stays_tunneled_until_route_is_armed():
-    excluded_updates = []
-    proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
-    proxy._proxy = SimpleNamespace(
-        set_intercept_excluded_hosts=lambda hosts: excluded_updates.append(set(hosts))
-    )
-    proxy._env_proxy_intercept_excluded_hosts = {'sober.vinegarhq.org'}
-
-    proxy._set_linux_sober_clientsettings_passthrough(True)
-    assert set(proxy_master.CUSTOM_FFLAGS_INTERCEPT_HOSTS) <= excluded_updates[-1]
-    assert 'sober.vinegarhq.org' in excluded_updates[-1]
-
-    proxy._set_linux_sober_clientsettings_passthrough(False)
-    assert not set(proxy_master.CUSTOM_FFLAGS_INTERCEPT_HOSTS) & excluded_updates[-1]
-    assert 'sober.vinegarhq.org' in excluded_updates[-1]
+    assert proxy._linux_env_proxy_excluded_hosts() == {'bootstrap.example'}
 
 
 def test_proxy_startup_self_tests_only_active_intercept_routes(tmp_path, monkeypatch):
@@ -938,11 +908,6 @@ def test_proxy_startup_self_tests_only_active_intercept_routes(tmp_path, monkeyp
     monkeypatch.setattr(proxy_master, "_run_tls_self_test", tls_self_test)
     monkeypatch.setattr(proxy_master.ProxyMaster, "_start_watchdog", lambda _self: None)
     monkeypatch.setattr(
-        proxy_master.ProxyMaster,
-        "_start_linux_sober_custom_fflag_timer",
-        lambda _self: None,
-    )
-    monkeypatch.setattr(
         "fleasion.utils.platform_linux.set_linux_client_env_proxy_override",
         lambda url, *, client_key: override_calls.append((url, client_key)) or True,
     )
@@ -983,8 +948,6 @@ def test_proxy_startup_self_tests_only_active_intercept_routes(tmp_path, monkeyp
     proxy._hosts_installed = False
     proxy._active_env_proxy_mode = False
     proxy._sober_env_proxy_override_active = False
-    proxy._sober_fflag_timer_stop = None
-    proxy._sober_fflag_timer_thread = None
     monkeypatch.setattr(
         proxy_master.ProxyMaster,
         "_startup_intercept_hosts",
@@ -1156,7 +1119,6 @@ def test_linux_helper_custom_fflags_adds_only_clientsettings_endpoints(monkeypat
         is_enabled=lambda: True,
         prime_windows_flag_cache=lambda: False,
     )
-    proxy._linux_sober_custom_fflag_routes_ready = lambda: True
     proxy._roblox_player_running = False
     proxy._active_intercept_hosts = set(proxy_master.BASE_INTERCEPT_HOSTS)
     proxy._hosts_installed = True

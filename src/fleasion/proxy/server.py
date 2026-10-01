@@ -1255,6 +1255,7 @@ class FleasionProxy:
             frozenset(intercept_hosts) if intercept_hosts is not None else INTERCEPT_HOSTS
         )
         self._intercept_all_hosts = bool(intercept_all_hosts)
+        self._intercept_connection_predicate: Optional[Callable[[str], bool]] = None
         self._intercept_excluded_hosts = frozenset(
             str(host).strip().lower().rstrip('.')
             for host in (intercept_excluded_hosts or ())
@@ -1636,9 +1637,25 @@ class FleasionProxy:
             str(host).strip().lower().rstrip('.') for host in hosts if str(host).strip()
         )
 
+    def set_intercept_connection_predicate(
+        self, predicate: Optional[Callable[[str], bool]]
+    ) -> None:
+        """Set a per-connection interception gate consulted for explicit CONNECTs.
+
+        The predicate receives the normalized host and returns True when the
+        connection may still be TLS-terminated.  None disables the gate.
+        """
+        self._intercept_connection_predicate = predicate
+
     def _should_intercept_explicit_host(self, host: str, port: int) -> bool:
         """Return whether an explicit-proxy CONNECT should be TLS-terminated."""
         normalized_host = (host or '').strip().lower().rstrip('.')
+        if self._intercept_connection_predicate is not None:
+            try:
+                if not self._intercept_connection_predicate(normalized_host):
+                    return False
+            except Exception:
+                logger.exception('Intercept connection predicate failed for %s', normalized_host)
         return (
             port == 443
             and normalized_host not in self._intercept_excluded_hosts
@@ -2100,6 +2117,12 @@ class FleasionProxy:
             return
 
         should_intercept = self._should_intercept_explicit_host(host, port)
+        if host in CUSTOM_FFLAGS_INTERCEPT_HOSTS:
+            log_buffer.log(
+                'CustomFFlags',
+                f'ClientSettings connection to {host}: '
+                f'{"TLS-intercepted" if should_intercept else "tunneled without interception"}',
+            )
         if not should_intercept:
             # Feature hosts (self._intercept_hosts) always work regardless of
             # this toggle - that's Fleasion's own texture stripper/custom
@@ -3162,6 +3185,20 @@ class FleasionProxy:
                     self.custom_fflag_modifier.note_response_success(
                         custom_fflag_delivered_signature,
                         generation=custom_fflag_request_generation,
+                    )
+                elif (
+                    custom_fflag_request
+                    and custom_fflag_delivered_signature is None
+                    and status_code == 304
+                ):
+                    # A 304 Not Modified means the client kept its cached copy.
+                    # When upstream flags are unchanged the conditional request
+                    # headers are no longer stripped, so Roblox answers 304 and
+                    # no body is intercepted; the round trip still proves the
+                    # live editing loop is working, so let it advance the
+                    # delivery notifications.
+                    self.custom_fflag_modifier.note_client_settings_seen(
+                        generation=custom_fflag_request_generation
                     )
 
                 if not _keep_alive(req_first, req_headers) or not _keep_alive(

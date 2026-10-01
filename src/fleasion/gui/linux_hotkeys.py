@@ -205,6 +205,20 @@ echo "Installed Fleasion Linux keybind permissions for $target_user."
 """
 
 
+def _most_specific_names(matches: list[tuple[str, int]]) -> list[str]:
+    """Return the names from ``matches`` bound with the most modifiers.
+
+    Bindings match when their required modifiers are a subset of the active
+    ones, so both a bare key and its shifted combination can match one press.
+    The combination with the most required modifiers wins, mirroring how
+    hotkey systems let Shift+A shadow A.
+    """
+    if not matches:
+        return []
+    best = max(required.bit_count() for _name, required in matches)
+    return [name for name, required in matches if required.bit_count() == best]
+
+
 def modifier_mask_for_evdev_code(code: int) -> int:
     """Return the generic modifier represented by an evdev key code."""
     if code in {_KEY_LEFTSHIFT, _KEY_RIGHTSHIFT}:
@@ -482,12 +496,15 @@ class LinuxHotkeyService(QObject):
             if was_pressed == is_pressed:
                 return
             active_modifiers = self._active_modifiers()
-            activations: list[str] = []
+            newly_active = [
+                (name, int(binding['modifiers']))
+                for name, binding in self._bindings.items()
+                if self._binding_is_active(binding, active_modifiers)
+                and not self._was_active.get(name, False)
+            ]
             for name, binding in self._bindings.items():
-                active = self._binding_is_active(binding, active_modifiers)
-                if active and not self._was_active.get(name, False):
-                    activations.append(name)
-                self._was_active[name] = active
+                self._was_active[name] = self._binding_is_active(binding, active_modifiers)
+            activations = _most_specific_names(newly_active)
 
         if is_pressed:
             self._emit_signal(self.key_pressed, code, active_modifiers)
@@ -519,16 +536,16 @@ class LinuxHotkeyService(QObject):
         with self._lock:
             modifiers = self._active_modifiers()
             direction = 'up' if delta > 0 else 'down'
-            activations = [
-                name
+            matches = [
+                (name, int(binding['modifiers']))
                 for name, binding in self._bindings.items()
                 if binding.get('kind') == 'mouse_wheel'
                 and binding.get('direction') == direction
-                and int(binding['modifiers']) == modifiers
+                and (modifiers & int(binding['modifiers'])) == int(binding['modifiers'])
             ]
         wheel_code = SMU_MOUSE_WHEEL_UP if delta > 0 else SMU_MOUSE_WHEEL_DOWN
         self._emit_signal(self.wheel_scrolled, wheel_code, modifiers)
-        for name in activations:
+        for name in _most_specific_names(matches):
             self._emit_signal(self.activated, name)
 
     def _binding_is_active(self, binding: HotkeyBinding, modifiers: int | None = None) -> bool:
@@ -537,9 +554,12 @@ class LinuxHotkeyService(QObject):
         code = int(binding['scan_code'])
         if modifiers is None:
             modifiers = self._active_modifiers()
-        return code in self._pressed and (modifiers & ~modifier_mask_for_evdev_code(code)) == int(
-            binding['modifiers']
-        )
+        required = int(binding['modifiers'])
+        # Extra held modifiers must not silence the binding: holding Shift
+        # while pressing the bound key still toggles.  Shadowing between a
+        # bare binding and its modified combination is resolved by firing
+        # only the most specific match for the same press.
+        return code in self._pressed and (modifiers & required) == required
 
     def stop(self) -> None:
         self._stop.set()

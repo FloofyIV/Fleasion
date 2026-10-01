@@ -373,6 +373,7 @@ class ProxyErrorInvoker(QObject):
     show_proxy_error = Signal(str, dict)
     disable_proxy_features = Signal(str)
     retry_proxy = Signal()
+    tray_notification = Signal(str, str)
 
     @Slot(str, dict)
     def handle_proxy_error(self, code: str, details: dict[str, object]) -> None:

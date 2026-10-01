@@ -4,6 +4,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from tests.hotkey_fakes import HotkeyConfig, HotkeyProxy
+from types import SimpleNamespace
 from typing import Never, cast
 
 import pytest
@@ -232,8 +233,45 @@ def test_linux_hotkey_reader_does_not_spin_after_all_devices_disconnect(
     assert len(select_calls) == 1
 
 
+def test_linux_bare_binding_still_fires_when_shift_is_held() -> None:
+    service = LinuxHotkeyService()
+    activations: list[str] = []
+    service.activated.connect(activations.append)
+    service._bindings = {
+        'flag1': {'platform': 'linux_evdev', 'scan_code': 30, 'modifiers': 0},
+    }
+    service._fds = {43: set()}
+
+    # Hold Shift first, then press the bound key.
+    service._set_key_state(43, 42, True)
+    service._set_key_state(43, 30, True)
+
+    assert activations == ['flag1']
+
+
+def test_linux_shifted_binding_shadows_bare_binding_on_the_same_key() -> None:
+    service = LinuxHotkeyService()
+    activations: list[str] = []
+    service.activated.connect(activations.append)
+    service._bindings = {
+        'bare': {'platform': 'linux_evdev', 'scan_code': 30, 'modifiers': 0},
+        'shifted': {'platform': 'linux_evdev', 'scan_code': 30, 'modifiers': MOD_SHIFT},
+    }
+    service._fds = {43: set()}
+
+    service._set_key_state(43, 42, True)
+    service._set_key_state(43, 30, True)
+    assert activations == ['shifted']
+
+    # Release Shift while keeping the key held, then press it again bare.
+    service._set_key_state(43, 30, False)
+    service._set_key_state(43, 42, False)
+    service._set_key_state(43, 30, True)
+    assert activations == ['shifted', 'bare']
+
+
 def test_linux_hotkey_controller_toggles_fastflag_folder() -> None:
-    config = HotkeyConfig(
+    config = SimpleNamespace(
         custom_fflags_enabled=True,
         custom_fflags={'FFlagOne': 'True', 'FFlagTwo': 'False'},
         custom_fflag_disabled=[],

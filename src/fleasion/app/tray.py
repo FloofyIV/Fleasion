@@ -6,7 +6,10 @@ import contextlib
 import ctypes
 import importlib
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
@@ -1016,12 +1019,18 @@ class SystemTray:
             return
 
         self._dashboard_close_notice_shown = True
-        title = APP_NAME
-        message = tr('tray.dashboard_closed_notice')
+        self.show_notification(APP_NAME, tr('tray.dashboard_closed_notice'))
+
+    def show_notification(self, title: str, message: str) -> None:
+        """Show a system-tray notification from any thread via a queued signal."""
         icon_path = get_icon_path()
 
         if sys.platform.startswith('linux') and _is_xfce_desktop():
             if self._show_xfce_notification(title, message, icon_path):
+                return
+
+        if sys.platform.startswith('linux'):
+            if self._show_freedesktop_notification(title, message, icon_path):
                 return
 
         if os.name != 'nt':
@@ -1038,6 +1047,48 @@ class SystemTray:
             self.tray.showMessage(title, message, QIcon(str(icon_path)), 10000)
         else:
             self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.NoIcon, 10000)
+
+    def _show_freedesktop_notification(
+        self, title: str, message: str, icon_path: Path | None
+    ) -> bool:
+        """Send a freedesktop notification carrying the app icon.
+
+        The bundled icon is an ``.ico`` file, which many notification daemons
+        cannot render, and ``QSystemTrayIcon.showMessage`` routinely drops the
+        icon on Linux.  Render the app icon to a temporary PNG and hand it to
+        ``notify-send`` so the notification reliably shows the app icon.
+        """
+        send_command = shutil.which('notify-send')
+        if send_command is None:
+            return False
+
+        png_path = Path(tempfile.gettempdir()) / f'{APP_NAME.lower()}-notification.png'
+        icon = QIcon(str(icon_path)) if icon_path is not None else self.tray.icon()
+        pixmap = icon.pixmap(64, 64)
+        try:
+            if pixmap.isNull() or not pixmap.save(str(png_path), 'PNG'):
+                return False
+
+            subprocess.run(
+                [
+                    send_command,
+                    '--app-name',
+                    APP_NAME,
+                    '--icon',
+                    str(png_path),
+                    '--expire-time',
+                    '10000',
+                    title,
+                    message,
+                ],
+                check=True,
+                timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return True
 
     def _show_xfce_notification(self, title: str, message: str, icon_path: Path | None) -> bool:
         """Show an app-owned notification so XFCE cannot apply unreadable colors."""

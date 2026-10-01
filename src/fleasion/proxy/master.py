@@ -1518,6 +1518,7 @@ def _select_proxy_ca_dir() -> Path:
 def _current_proxy_ca_dir() -> Path:
     return _ACTIVE_PROXY_CA_DIR
 
+
 _CUSTOM_FFLAG_FIRST_LAUNCH_PASSTHROUGH_COUNT = 1
 _custom_fflag_passthrough_lock = threading.Lock()
 _custom_fflag_launch_passthrough_remaining: int = _CUSTOM_FFLAG_FIRST_LAUNCH_PASSTHROUGH_COUNT
@@ -1526,7 +1527,9 @@ _custom_fflag_last_engine_process: tuple[int, float] | None = None
 
 def _custom_fflag_engine_process() -> tuple[int, float] | None:
     """Return the selected Linux client's engine process identity, if running."""
-    from ..utils.platform_linux import linux_client_main_process
+    from fleasion.utils.platform_linux import (  # ruff: ignore[import-outside-top-level]
+        linux_client_main_process,
+    )
 
     return linux_client_main_process(_selected_linux_client_installation())
 
@@ -1542,7 +1545,7 @@ def _should_intercept_custom_fflag_connection() -> bool:
     re-arms whenever a new engine process identity is seen, so every launch
     behaves the same way.
     """
-    global _custom_fflag_launch_passthrough_remaining, _custom_fflag_last_engine_process
+    global _custom_fflag_launch_passthrough_remaining, _custom_fflag_last_engine_process  # ruff: ignore[global-statement]
 
     if not IS_LINUX:
         return True
@@ -1574,6 +1577,14 @@ def _should_intercept_custom_fflag_connection() -> bool:
         'clientsettingscdn.roblox.com connection: passing to interception',
     )
     return True
+
+
+def _custom_fflag_intercept_predicate(host: str) -> bool:
+    """Intercept gate for CONNECT hosts, honoring the launch fall-through window."""
+    return (
+        host not in CUSTOM_FFLAGS_INTERCEPT_HOSTS
+        or _should_intercept_custom_fflag_connection()
+    )
 
 
 def _is_macos_studio_bundle_path(exe_path: Path) -> bool:
@@ -5185,7 +5196,7 @@ class ProxyMaster:
             return
         try:
             self._on_notify(title, message)
-        except Exception as exc:
+        except Exception as exc:  # ruff: ignore[blind-except]
             log_buffer.log('Error', f'Failed to dispatch proxy notification callback: {exc}')
 
     def _start_watchdog(self) -> None:
@@ -6405,12 +6416,7 @@ class ProxyMaster:
         if IS_LINUX:
             predicate_setter = getattr(proxy, 'set_intercept_connection_predicate', None)
             if callable(predicate_setter):
-                predicate_setter(
-                    lambda host: (
-                        host not in CUSTOM_FFLAGS_INTERCEPT_HOSTS
-                        or _should_intercept_custom_fflag_connection()
-                    )
-                )
+                predicate_setter(_custom_fflag_intercept_predicate)
 
         log_buffer.log('Info', '=' * 50)
         log_buffer.log('Info', 'Fleasion Proxy Active')
@@ -6584,12 +6590,7 @@ class ProxyMaster:
         if IS_LINUX:
             predicate_setter = getattr(proxy, 'set_intercept_connection_predicate', None)
             if callable(predicate_setter):
-                predicate_setter(
-                    lambda host: (
-                        host not in CUSTOM_FFLAGS_INTERCEPT_HOSTS
-                        or _should_intercept_custom_fflag_connection()
-                    )
-                )
+                predicate_setter(_custom_fflag_intercept_predicate)
         hosts_ready_event = getattr(self, '_hosts_proxy_ready', None)
         if hosts_ready_event is not None:
             hosts_ready_event.set()

@@ -52,16 +52,8 @@ class _ProxyStartErrorCallback(Protocol):
     def __call__(self, code: str, details: dict[str, object]) -> None: ...
 
 
-class _EnvOverrideCallback(Protocol):
-    def __call__(self, url: str, *, client_key: str) -> bool: ...
-
-
 class _HostUpdateCallback(Protocol):
     def __call__(self, hosts: set[str]) -> bool: ...
-
-
-class _HostSinkCallback(Protocol):
-    def __call__(self, hosts: Iterable[str]) -> None: ...
 
 
 type _EndpointMap = dict[str, list[proxy_master.UpstreamEndpoint]]
@@ -116,6 +108,22 @@ def _collect_proxy_errors(
         errors.append((code, details))
 
     return on_error
+
+
+def _collect_env_override_calls(calls: list[tuple[str, str]]) -> Callable[[str, str], bool]:
+    def override(url: str, client_key: str) -> bool:
+        calls.append((url, client_key))
+        return True
+
+    return override
+
+
+def _should_intercept_custom_fflag_connection() -> bool:
+    gate = cast(
+        'Callable[[], bool]',
+        getattr(proxy_master, '_should_intercept_custom_fflag_connection'),
+    )
+    return gate()
 
 
 def _collect_host_updates(calls: list[set[str]]) -> _HostUpdateCallback:
@@ -211,13 +219,13 @@ def test_linux_proxy_stop_clears_exact_owned_flatpak_env_override(
 ) -> None:
     calls: list[str] = []
     proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
-    proxy._env_proxy_ready = threading.Event()
-    proxy._env_proxy_ready.set()
-    proxy._linux_env_proxy_override_client_key = 'sober'
-    proxy._sober_env_proxy_override_active = True
-    proxy._lock = threading.Lock()
-    proxy._running = False
-    proxy._thread = None
+    setattr(proxy, '_env_proxy_ready', threading.Event())
+    getattr(proxy, '_env_proxy_ready').set()
+    setattr(proxy, '_linux_env_proxy_override_client_key', 'sober')
+    setattr(proxy, '_sober_env_proxy_override_active', True)
+    setattr(proxy, '_lock', threading.Lock())
+    setattr(proxy, '_running', False)
+    setattr(proxy, '_thread', None)
 
     monkeypatch.setattr(proxy_master, 'IS_LINUX', True)
 
@@ -1081,11 +1089,11 @@ def test_linux_custom_fflags_intercept_immediately_for_engine_process(
 ) -> None:
     monkeypatch.setattr(proxy_master, 'IS_LINUX', True)
     proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
-    proxy.config_manager = SimpleNamespace(settings={})
-    proxy.username_spoofer = SimpleNamespace(is_enabled=lambda: False)
-    proxy.custom_fflag_modifier = SimpleNamespace(is_enabled=lambda: True)
+    setattr(proxy, 'config_manager', SimpleNamespace(settings={}))
+    setattr(proxy, 'username_spoofer', SimpleNamespace(is_enabled=_callback0(lambda: False)))
+    setattr(proxy, 'custom_fflag_modifier', SimpleNamespace(is_enabled=_callback0(lambda: True)))
 
-    assert proxy._desired_intercept_hosts() == (
+    assert getattr(proxy, '_desired_intercept_hosts')() == (
         set(proxy_master.BASE_INTERCEPT_HOSTS)
         | set(proxy_master.CUSTOM_FFLAGS_INTERCEPT_HOSTS)
     )
@@ -1101,37 +1109,41 @@ def test_linux_custom_fflags_first_engine_request_falls_through(
     monkeypatch.setattr(
         platform_linux,
         'linux_client_main_process',
-        lambda _installation: engine['process'],
+        _callback1(lambda _installation: engine['process']),
     )
-    proxy_master._custom_fflag_launch_passthrough_remaining = 1
-    proxy_master._custom_fflag_last_engine_process = None
+    monkeypatch.setattr(proxy_master, '_custom_fflag_launch_passthrough_remaining', 1)
+    monkeypatch.setattr(proxy_master, '_custom_fflag_last_engine_process', None)
 
     # The very first engine request of a launch tunnels through untouched:
     # intercepting the pinned bootstrap fetch makes the client refuse to start.
-    assert not proxy_master._should_intercept_custom_fflag_connection()
+    assert not _should_intercept_custom_fflag_connection()
     # From the second request on, the connection is TLS-intercepted.
-    assert proxy_master._should_intercept_custom_fflag_connection()
-    assert proxy_master._should_intercept_custom_fflag_connection()
+    assert _should_intercept_custom_fflag_connection()
+    assert _should_intercept_custom_fflag_connection()
 
     # A relaunched engine process (new identity) re-arms the fall-through even
     # if no connection was observed while the client was closed.
     engine['process'] = (1002, 0.0)
-    assert not proxy_master._should_intercept_custom_fflag_connection()
-    assert proxy_master._should_intercept_custom_fflag_connection()
-    assert proxy_master._should_intercept_custom_fflag_connection()
+    assert not _should_intercept_custom_fflag_connection()
+    assert _should_intercept_custom_fflag_connection()
+    assert _should_intercept_custom_fflag_connection()
 
 
 def test_linux_env_proxy_exclusions_come_from_selected_descriptor() -> None:
     proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
-    proxy._active_linux_client_key = 'sober'
-    proxy._active_linux_client_installation = SimpleNamespace(
-        key='sober',
-        client=SimpleNamespace(
-            proxy_passthrough_hosts=frozenset({'bootstrap.example'}),
+    setattr(proxy, '_active_linux_client_key', 'sober')
+    setattr(
+        proxy,
+        '_active_linux_client_installation',
+        SimpleNamespace(
+            key='sober',
+            client=SimpleNamespace(
+                proxy_passthrough_hosts=frozenset({'bootstrap.example'}),
+            ),
         ),
     )
 
-    assert proxy._linux_env_proxy_excluded_hosts() == {'bootstrap.example'}
+    assert getattr(proxy, '_linux_env_proxy_excluded_hosts')() == {'bootstrap.example'}
 
 
 def test_proxy_startup_self_tests_only_active_intercept_routes(
@@ -1252,7 +1264,7 @@ def test_proxy_startup_self_tests_only_active_intercept_routes(
     monkeypatch.setattr(proxy_master.ProxyMaster, '_start_watchdog', _callback1(lambda _self: None))
     monkeypatch.setattr(
         'fleasion.utils.platform_linux.set_linux_client_env_proxy_override',
-        lambda url, *, client_key: override_calls.append((url, client_key)) or True,
+        _collect_env_override_calls(override_calls),
     )
     monkeypatch.setattr(
         proxy_master,
@@ -1292,17 +1304,17 @@ def test_proxy_startup_self_tests_only_active_intercept_routes(
             prime_windows_flag_cache=_callback0(lambda: False),
         ),
     )
-    proxy._module_interceptors = []
-    proxy._on_proxy_start_error = lambda *_args: None
-    proxy._running = False
-    proxy._lock = threading.Lock()
-    proxy._loop = None
-    proxy._env_proxy_intercept_match = ''
-    proxy._env_proxy_intercept_all = False
-    proxy._active_intercept_hosts = set()
-    proxy._hosts_installed = False
-    proxy._active_env_proxy_mode = False
-    proxy._sober_env_proxy_override_active = False
+    setattr(proxy, '_module_interceptors', [])
+    setattr(proxy, '_on_proxy_start_error', _collect_proxy_errors([]))
+    setattr(proxy, '_running', False)
+    setattr(proxy, '_lock', threading.Lock())
+    setattr(proxy, '_loop', None)
+    setattr(proxy, '_env_proxy_intercept_match', '')
+    setattr(proxy, '_env_proxy_intercept_all', False)
+    setattr(proxy, '_active_intercept_hosts', set())
+    setattr(proxy, '_hosts_installed', False)
+    setattr(proxy, '_active_env_proxy_mode', False)
+    setattr(proxy, '_sober_env_proxy_override_active', False)
     monkeypatch.setattr(
         proxy_master.ProxyMaster,
         '_startup_intercept_hosts',
@@ -1536,14 +1548,18 @@ def test_linux_helper_custom_fflags_adds_only_clientsettings_endpoints(
             prime_windows_flag_cache=_callback0(lambda: False),
         ),
     )
-    proxy._roblox_player_running = False
-    proxy._active_intercept_hosts = set(proxy_master.BASE_INTERCEPT_HOSTS)
-    proxy._hosts_installed = True
-    proxy._proxy = ProxyStub()
-    proxy._lock = threading.Lock()
-    proxy.cache_scraper = SimpleNamespace(
-        set_real_ips=lambda _ips: None,
-        set_http_proxy_fallback=lambda _proxy: None,
+    setattr(proxy, '_roblox_player_running', False)
+    setattr(proxy, '_active_intercept_hosts', set(proxy_master.BASE_INTERCEPT_HOSTS))
+    setattr(proxy, '_hosts_installed', True)
+    setattr(proxy, '_proxy', ProxyStub())
+    setattr(proxy, '_lock', threading.Lock())
+    setattr(
+        proxy,
+        'cache_scraper',
+        SimpleNamespace(
+            set_real_ips=_callback1(lambda _ips: None),
+            set_http_proxy_fallback=_callback1(lambda _proxy: None),
+        ),
     )
 
     proxy.refresh_custom_fflag_interception()

@@ -10,7 +10,7 @@ import threading
 import time
 from compression.zstd import ZstdError, compress as zstd_compress, decompress as zstd_decompress
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeIs
+from typing import TYPE_CHECKING, Protocol, TypeIs, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -126,6 +126,7 @@ class CustomFFlagModifier:
     def __init__(
         self,
         config_manager: object,
+        *,
         flag_cache_path: Path | None = None,
         settings_path: Path | None = None,
         reload_settings_from_disk: bool = False,
@@ -257,7 +258,7 @@ class CustomFFlagModifier:
             return
         try:
             callback('Fleasion', message)
-        except Exception as exc:
+        except Exception as exc:  # ruff: ignore[blind-except]
             log_buffer.log(
                 'CustomFFlags',
                 f'Failed to dispatch FastFlag delivery notification: {exc}',
@@ -448,7 +449,9 @@ class CustomFFlagModifier:
 
         cache_path = self._linux_flag_cache_path
         if cache_path is None:
-            from ...utils.platform_linux import SOBER_FLAG_CACHE_PATH
+            from fleasion.utils.platform_linux import (  # ruff: ignore[import-outside-top-level]
+                SOBER_FLAG_CACHE_PATH,
+            )
 
             cache_path = SOBER_FLAG_CACHE_PATH
         cache_dir = cache_path.parent
@@ -463,7 +466,7 @@ class CustomFFlagModifier:
             _lock_linux_flag_cache(cache_dir, cache_path)
         return changed
 
-    def _prime_flag_cache_file(
+    def _prime_flag_cache_file(  # ruff: ignore[too-many-return-statements]
         self,
         cache_path: Path,
         seeded_names: set[str],
@@ -476,7 +479,7 @@ class CustomFFlagModifier:
         (compression byte 0) and zstd (byte 1) layouts and preserves the
         original compression on write.
         """
-        try:
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
             raw = cache_path.read_bytes()
             if len(raw) < 5:
                 return False, {}, set()
@@ -498,6 +501,7 @@ class CustomFFlagModifier:
             application_settings = payload.get('applicationSettings')
             if not isinstance(application_settings, dict):
                 return False, {}, set()
+            app_settings = cast('dict[str, object]', application_settings)
 
             enabled = self.is_enabled()
             flags = self.runtime_flags() if enabled else {}
@@ -512,9 +516,9 @@ class CustomFFlagModifier:
                 seeded_names | saved_names | {DYNAMIC_VARIABLE_RELOAD_INTERVAL_FLAG}
             ) - set(flags)
             removed_names = {
-                name for name in stale_names if application_settings.pop(name, None) is not None
+                name for name in stale_names if app_settings.pop(name, None) is not None
             }
-            application_settings.update(flags)
+            app_settings.update(flags)
             updated_payload = json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode(
                 'utf-8'
             )
@@ -529,7 +533,6 @@ class CustomFFlagModifier:
                 temporary_path.replace(cache_path)
             finally:
                 temporary_path.unlink(missing_ok=True)
-            return True, flags, removed_names
         except (
             OSError,
             ValueError,
@@ -538,6 +541,7 @@ class CustomFFlagModifier:
             ZstdError,
         ):
             return False, {}, set()
+        return True, flags, removed_names
 
     @staticmethod
     def _log_flag_cache_seed(
@@ -679,11 +683,13 @@ class CustomFFlagModifier:
             saved_names = set(normalize_custom_fflags(saved_flags))
             saved_names.add(DYNAMIC_VARIABLE_RELOAD_INTERVAL_FLAG)
         stale_names = (self._macos_seeded_flag_names | saved_names) - desired_names
-        updated_paths = sum(
-            self._prime_macos_client_settings_path(target, flags, stale_names) for target in paths
+        return (
+            sum(
+                self._prime_macos_client_settings_path(target, flags, stale_names)
+                for target in paths
+            )
+            > 0
         )
-
-        return updated_paths
 
     def prime_startup_flag_cache(self) -> bool:
         """Seed the platform-specific local flag source used before networking."""

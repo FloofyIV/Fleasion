@@ -1622,7 +1622,7 @@ class FleasionProxy:
             frozenset(intercept_hosts) if intercept_hosts is not None else INTERCEPT_HOSTS
         )
         self._intercept_all_hosts = bool(intercept_all_hosts)
-        self._intercept_connection_predicate: Optional[Callable[[str], bool]] = None
+        self._intercept_connection_predicate: Callable[[str], bool] | None = None
         self._intercept_excluded_hosts = frozenset(
             str(host).strip().lower().rstrip('.')
             for host in (intercept_excluded_hosts or ())
@@ -2000,7 +2000,7 @@ class FleasionProxy:
         )
 
     def set_intercept_connection_predicate(
-        self, predicate: Optional[Callable[[str], bool]]
+        self, predicate: Callable[[str], bool] | None
     ) -> None:
         """Set a per-connection interception gate consulted for explicit CONNECTs.
 
@@ -3520,7 +3520,7 @@ class FleasionProxy:
                     # no body is intercepted; the round trip still proves the
                     # live editing loop is working, so let it advance the
                     # delivery notifications.
-                    self.custom_fflag_modifier.note_client_settings_seen(
+                    custom_fflag_modifier.note_client_settings_seen(
                         generation=custom_fflag_request_generation
                     )
 

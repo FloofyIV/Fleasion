@@ -213,8 +213,8 @@ class CustomFFlagModifier:
             return None
         self._delivery_notifications_sent += 1
         if self._delivery_notifications_sent == 1:
-            return 'FFlags applied'
-        return 'Live editing now available'
+            return 'Dynamic FFlags applied'
+        return 'Live FFlag editing now available'
 
 
     def _dispatch_delivery_notification(self, message: str) -> None:

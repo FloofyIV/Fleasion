@@ -4043,7 +4043,9 @@ class ProxyMaster:
         set_delivery_notification_callback = getattr(
             self.custom_fflag_modifier, 'set_delivery_notification_callback', None
         )
-        if callable(set_delivery_notification_callback):
+        if IS_LINUX and callable(set_delivery_notification_callback):
+            # Sober flag delivery is a Linux-only flow; on other platforms the
+            # modifier keeps its default no-op notification state.
             set_delivery_notification_callback(self._emit_custom_fflag_notification)
 
         self._texture_stripper: Optional[TextureStripper] = None

@@ -2,17 +2,15 @@ import asyncio
 import json
 import stat
 import threading
-from compression.zstd import compress as zstd_compress, decompress as zstd_decompress
 from types import SimpleNamespace
 
+from fleasion.proxy import master as proxy_master
 from fleasion.proxy.addons import custom_fflags as custom_fflags_module
 from fleasion.proxy.addons.custom_fflags import (
     DYNAMIC_VARIABLE_RELOAD_INTERVAL_FLAG,
     CustomFFlagModifier,
     normalize_custom_fflags,
 )
-from fleasion.proxy import master as proxy_master
-from fleasion.proxy.upstream import UpstreamConnectResult
 from fleasion.proxy.server import (
     BASE_INTERCEPT_HOSTS,
     CUSTOM_FFLAGS_INTERCEPT_HOSTS,
@@ -20,12 +18,13 @@ from fleasion.proxy.server import (
     RawHeaders,
     _build_modified_response,
     _compress_dcz,
+    _dcz_dictionary_sha256,
     _decompress_body,
     _decompress_dcz,
-    _dcz_dictionary_sha256,
-    _without_internal_client_settings_headers,
     _without_conditional_client_settings_headers,
+    _without_internal_client_settings_headers,
 )
+from fleasion.proxy.upstream import UpstreamConnectResult
 
 
 class _BufferWriter:
@@ -92,7 +91,7 @@ def _run_client_settings_session(
 
         proxy = FleasionProxy.__new__(FleasionProxy)
         proxy.texture_stripper = SimpleNamespace(
-            config_manager=SimpleNamespace(get_all_replacements=lambda: [])
+            config_manager=SimpleNamespace(get_all_replacements=list)
         )
         proxy.cache_scraper = SimpleNamespace(enabled=False)
         proxy.custom_fflag_modifier = modifier
@@ -232,8 +231,7 @@ def test_modifier_primes_the_uncompressed_windows_flag_cache(tmp_path):
     )
     cache_path = tmp_path / 'flag_cache.dat'
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, flag_cache_path=cache_path)
 
@@ -255,8 +253,7 @@ def test_modifier_removes_disabled_override_from_windows_flag_cache(tmp_path):
     )
     cache_path = tmp_path / 'flag_cache.dat'
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, flag_cache_path=cache_path)
 
@@ -277,8 +274,7 @@ def test_modifier_removes_all_saved_overrides_when_windows_feature_is_disabled(t
     )
     cache_path = tmp_path / 'flag_cache.dat'
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, flag_cache_path=cache_path)
 
@@ -299,8 +295,7 @@ def test_modifier_primes_linux_sober_flag_cache(tmp_path):
     cache_path = cache_dir / 'flag_cache.dat'
     cache_dir.mkdir()
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
     try:
@@ -341,8 +336,7 @@ def test_modifier_unlocks_and_reseeds_locked_linux_sober_flag_cache(tmp_path):
     cache_path = cache_dir / 'flag_cache.dat'
     cache_dir.mkdir()
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
     try:
@@ -369,8 +363,7 @@ def test_modifier_removes_previous_linux_seed_when_flags_change_or_disable(tmp_p
     cache_path = cache_dir / 'flag_cache.dat'
     cache_dir.mkdir()
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, linux_flag_cache_path=cache_path)
     try:
@@ -387,7 +380,6 @@ def test_modifier_removes_previous_linux_seed_when_flags_change_or_disable(tmp_p
     finally:
         cache_path.chmod(0o644)
         cache_dir.chmod(0o755)
-
 
 
 def test_modifier_primes_macos_player_client_settings(tmp_path):
@@ -494,17 +486,17 @@ def test_delivery_notifications_fire_once_per_stage_and_rearm_after_relaunch():
     modifier.note_response_success()
     modifier.note_response_success()
     modifier.note_response_success()
-    assert messages == ['FFlags applied', 'Live editing now available']
+    assert messages == ['Dynamic FFlags applied', 'Live FFlag editing now available']
 
     # Closing and reopening the client re-arms both notifications.
     modifier.prepare_for_player_launch()
     modifier.note_response_success()
     modifier.note_response_success()
     assert messages == [
-        'FFlags applied',
-        'Live editing now available',
-        'FFlags applied',
-        'Live editing now available',
+        'Dynamic FFlags applied',
+        'Live FFlag editing now available',
+        'Dynamic FFlags applied',
+        'Live FFlag editing now available',
     ]
 
 
@@ -531,12 +523,12 @@ def test_bodyless_304_response_advances_delivery_notifications():
     # bookkeeping, but it still proves the live loop and must fire the second
     # notification.
     assert modifier.note_client_settings_seen()
-    assert messages == ['FFlags applied', 'Live editing now available']
+    assert messages == ['Dynamic FFlags applied', 'Live FFlag editing now available']
 
     assert modifier.requires_fresh_response() is False
     modifier.prepare_for_player_launch()
     assert not modifier.note_client_settings_seen(generation=0)
-    assert messages == ['FFlags applied', 'Live editing now available']
+    assert messages == ['Dynamic FFlags applied', 'Live FFlag editing now available']
 
 
 def test_delivery_notification_callback_faults_never_break_delivery():
@@ -665,9 +657,7 @@ def test_proxy_logs_empty_2xx_client_settings_responses_as_delivery_failures():
 
         _run_client_settings_session(
             modifier,
-            b'HTTP/1.1 '
-            + status_line
-            + b'\r\nContent-Length: 0\r\nConnection: close\r\n\r\n',
+            b'HTTP/1.1 ' + status_line + b'\r\nContent-Length: 0\r\nConnection: close\r\n\r\n',
         )
 
         assert failures == [
@@ -854,7 +844,7 @@ def test_request_started_before_launch_generation_bump_cannot_satisfy_new_player
 def test_fresh_client_settings_request_strips_only_conditional_headers():
     original = {
         b'accept-encoding': b'dcz',
-        b'if-none-match': b'\"old-etag\"',
+        b'if-none-match': b'"old-etag"',
         b'if-modified-since': b'last week',
     }
 
@@ -898,8 +888,7 @@ def test_modifier_is_true_passthrough_when_disabled():
     original = b'{"applicationSettings":{"Existing":"True"}}'
 
     assert (
-        modifier.modify_response('/v2/settings/application/PCDesktopClient', original)
-        is original
+        modifier.modify_response('/v2/settings/application/PCDesktopClient', original) is original
     )
 
 
@@ -961,10 +950,13 @@ def test_dcz_round_trip_uses_the_client_dictionary_and_extracts_its_hash():
 
     assert compressed is not None
     assert _decompress_dcz(compressed, dictionary) == plain
-    assert _dcz_dictionary_sha256(
-        '/v2/settings-compressed/application/GoogleAndroidApp/'
-        '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b.dcz?x=1'
-    ) == '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b'
+    assert (
+        _dcz_dictionary_sha256(
+            '/v2/settings-compressed/application/GoogleAndroidApp/'
+            '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b.dcz?x=1'
+        )
+        == '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b'
+    )
     assert _dcz_dictionary_sha256('/v2/client-version/WindowsPlayer') is None
 
 
